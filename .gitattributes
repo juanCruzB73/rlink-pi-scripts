@@ -1,0 +1,2 @@
+# Estos archivos corren en la Pi: siempre LF, nunca CRLF.
+* text eol=lf

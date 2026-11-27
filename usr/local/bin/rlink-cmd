@@ -1,0 +1,194 @@
+#!/bin/bash
+# /usr/local/bin/rlink-cmd — agente que recibe comandos por MQTT y los ejecuta en la Pi.
+#
+# Escucha dos topics:
+#   pi/<agent_key>/cmd   comando dirigido a esta Pi
+#   pi/all/cmd           comando broadcast a todas las Pis
+#
+# Responde en:
+#   pi/<agent_key>/ack   resultado (exit_code + log truncado)
+#   pi/<agent_key>/status  "online"/"offline" (offline por LWT cuando se cae)
+#
+# Identidad: usa /etc/rlink-agent-key (la misma que rlink-reporte). Si no existe, espera a que
+# rlink-reporte la genere; no inventa una propia.
+#
+# Comandos aceptados (whitelist estricta — cualquier otro se ignora con exit_code=127):
+#   update            cd /opt/rlink-scripts && git pull && bash install.sh (si cambió)
+#   reboot            systemctl reboot (no hay ack: la Pi se apaga antes)
+#   restart-chromium  pkill chromium (kiosk.sh lo relanza solo)
+#   redownload-media  borra el cache de media y recarga la página
+#   ping              responde "pong" inmediato
+#
+# El payload entra como JSON:
+#   { "cmd": "update", "cmd_id": "<uuid>", "issued_by": "<user_id>", "issued_at": "<iso8601>" }
+# El ack sale como:
+#   { "cmd_id": "<uuid>", "exit_code": 0, "log": "...", "finished_at": "<iso8601>" }
+#
+# Corre como root desde systemd (ver /etc/systemd/system/rlink-cmd.service).
+# Log:         journalctl -u rlink-cmd -f
+# Probar:      sudo RLINK_MQTT_HOST=localhost rlink-cmd
+#
+# Dependencias:  mosquitto-clients (para mosquitto_sub / mosquitto_pub)
+#
+# Configuración (variables de entorno, ver el .service):
+#   RLINK_MQTT_HOST    broker MQTT (carteleria.rlink.com.ar)
+#   RLINK_MQTT_PORT    1883 (sin TLS por ahora; subir a 8883 cuando esté el cert)
+#   RLINK_MQTT_USER    opcional
+#   RLINK_MQTT_PASS    opcional
+#   RLINK_SCRIPTS_DIR  dónde hace git pull (/opt/rlink-scripts)
+
+set -u
+
+RLINK_MQTT_HOST=${RLINK_MQTT_HOST:-carteleria.rlink.com.ar}
+RLINK_MQTT_PORT=${RLINK_MQTT_PORT:-1883}
+RLINK_MQTT_USER=${RLINK_MQTT_USER:-}
+RLINK_MQTT_PASS=${RLINK_MQTT_PASS:-}
+RLINK_SCRIPTS_DIR=${RLINK_SCRIPTS_DIR:-/opt/rlink-scripts}
+KEY_FILE=/etc/rlink-agent-key
+
+# Esperamos a que rlink-reporte haya generado la clave. Si no está después de 5 minutos, nos caemos
+# y systemd nos reintenta (no inventar una clave propia: daría dos identidades para el mismo equipo).
+for _ in $(seq 1 30); do
+  [ -s "$KEY_FILE" ] && break
+  sleep 10
+done
+if [ ! -s "$KEY_FILE" ]; then
+  echo "rlink-cmd: $KEY_FILE no existe. ¿rlink-reporte está instalado?" >&2
+  exit 1
+fi
+KEY=$(cat "$KEY_FILE")
+
+TOPIC_CMD="pi/$KEY/cmd"
+TOPIC_ALL="pi/all/cmd"
+TOPIC_ACK="pi/$KEY/ack"
+TOPIC_STATUS="pi/$KEY/status"
+
+auth_args=()
+if [ -n "$RLINK_MQTT_USER" ]; then
+  auth_args+=(-u "$RLINK_MQTT_USER" -P "$RLINK_MQTT_PASS")
+fi
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+publish() {
+  local topic=$1 payload=$2 retain=${3:-}
+  local args=(-h "$RLINK_MQTT_HOST" -p "$RLINK_MQTT_PORT" "${auth_args[@]}" -q 1 -t "$topic" -m "$payload")
+  [ -n "$retain" ] && args+=(-r)
+  mosquitto_pub "${args[@]}" 2>/dev/null || true
+}
+
+# Escapa un string para meterlo en un JSON (tabs, saltos de línea, comillas, backslashes).
+json_escape() {
+  python3 -c 'import json,sys;print(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null \
+    || sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g' -e 's/\t/\\t/g'
+}
+
+run_cmd() {
+  local cmd=$1
+  case "$cmd" in
+    update)
+      if [ ! -d "$RLINK_SCRIPTS_DIR/.git" ]; then
+        echo "no es un repo git: $RLINK_SCRIPTS_DIR"
+        return 1
+      fi
+      cd "$RLINK_SCRIPTS_DIR" || return 1
+      git fetch --quiet || { echo "git fetch falló"; return 1; }
+      local before after
+      before=$(git rev-parse HEAD)
+      git pull --ff-only || { echo "git pull falló"; return 1; }
+      after=$(git rev-parse HEAD)
+      if [ "$before" = "$after" ]; then
+        echo "sin cambios"
+        return 0
+      fi
+      echo "actualizado $before → $after"
+      if [ -x "$RLINK_SCRIPTS_DIR/install.sh" ]; then
+        echo "corriendo install.sh"
+        "$RLINK_SCRIPTS_DIR/install.sh" 2>&1 | tail -n 40
+      fi
+      return 0
+      ;;
+    reboot)
+      echo "reiniciando"
+      # Dejamos el ack preparado antes del reboot. systemd matará el proceso al apagar.
+      ( sleep 2 && systemctl reboot ) &
+      return 0
+      ;;
+    restart-chromium)
+      pkill -f chromium 2>/dev/null
+      echo "chromium matado; kiosk.sh lo relanza"
+      return 0
+      ;;
+    redownload-media)
+      # Placeholder — depende de dónde cachea el player. Por ahora, reiniciar chromium alcanza
+      # si el player vuelve a bajar al cargar.
+      pkill -f chromium 2>/dev/null
+      echo "cache de media invalidado (vía restart chromium)"
+      return 0
+      ;;
+    ping)
+      echo "pong"
+      return 0
+      ;;
+    *)
+      echo "comando no reconocido: $cmd"
+      return 127
+      ;;
+  esac
+}
+
+handle_message() {
+  local line=$1
+  # Topic y payload separados por el primer espacio (-F "%t %p" en mosquitto_sub).
+  local topic=${line%% *}
+  local payload=${line#* }
+
+  # Extraer cmd y cmd_id del JSON. Si no hay python3, caemos a un sed grosero.
+  local cmd cmd_id
+  if command -v python3 >/dev/null 2>&1; then
+    cmd=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('cmd',''))" "$payload" 2>/dev/null)
+    cmd_id=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('cmd_id',''))" "$payload" 2>/dev/null)
+  else
+    cmd=$(echo "$payload" | sed -n 's/.*"cmd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    cmd_id=$(echo "$payload" | sed -n 's/.*"cmd_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  fi
+
+  if [ -z "$cmd" ]; then
+    echo "rlink-cmd: payload sin cmd: $payload" >&2
+    return
+  fi
+
+  echo "rlink-cmd: topic=$topic cmd=$cmd cmd_id=$cmd_id"
+
+  local out exit_code
+  out=$(run_cmd "$cmd" 2>&1)
+  exit_code=$?
+
+  local log_escaped
+  log_escaped=$(printf '%s' "$out" | head -c 2000 | json_escape)
+
+  local ack="{\"cmd_id\":\"$cmd_id\",\"cmd\":\"$cmd\",\"exit_code\":$exit_code,\"log\":\"$log_escaped\",\"finished_at\":\"$(now_iso)\"}"
+  publish "$TOPIC_ACK" "$ack"
+}
+
+# Marcamos presencia al conectar y dejamos LWT para avisar si nos caemos.
+# mosquitto_sub publica el will cuando pierde conexión, y sube "online" retained al reconectar.
+echo "rlink-cmd: suscribiendo a $TOPIC_CMD y $TOPIC_ALL (broker $RLINK_MQTT_HOST:$RLINK_MQTT_PORT)"
+
+mosquitto_sub \
+  -h "$RLINK_MQTT_HOST" -p "$RLINK_MQTT_PORT" "${auth_args[@]}" \
+  -q 1 \
+  -t "$TOPIC_CMD" -t "$TOPIC_ALL" \
+  -F '%t %p' \
+  --will-topic "$TOPIC_STATUS" --will-payload "offline" --will-qos 1 --will-retain \
+  | while IFS= read -r line; do
+      # Publicar "online" (retained) la primera vez que podemos — después de la primera suscripción.
+      if [ -z "${ANNOUNCED:-}" ]; then
+        publish "$TOPIC_STATUS" "online" retain
+        ANNOUNCED=1
+      fi
+      handle_message "$line"
+    done
+
+# Si mosquitto_sub muere, systemd nos reinicia.
+exit 1

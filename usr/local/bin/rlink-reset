@@ -1,0 +1,59 @@
+#!/bin/bash
+# /usr/local/bin/rlink-reset — resetea la Pi a estado "recién instalada"
+#
+# Borra:
+#   - Clave del agente (se generará nueva en el próximo arranque)
+#   - Modo guardado (setup/kiosk)
+#   - Configuraciones de Wi-Fi guardadas en NetworkManager
+#   - Métricas pendientes del reporte
+#   - Logs de setup
+#   - localStorage del navegador del kiosko
+#
+# Uso:   sudo rlink-reset
+#
+# Después de ejecutar, reinicia la Pi: sudo reboot
+
+set -euo pipefail
+
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+[ "$(id -u)" -eq 0 ] || { echo "corré con sudo"; exit 1; }
+
+log "Limpiando clave del agente..."
+rm -f /etc/rlink-agent-key
+
+log "Limpiando modo guardado..."
+rm -rf /run/rlink-setup
+
+log "Limpiando perfiles de Wi-Fi guardados en NetworkManager..."
+for conn in $(nmcli -t -f NAME connection show 2>/dev/null | grep -v "^RLINK-SETUP$" || true); do
+  nmcli connection delete "$conn" 2>/dev/null || true
+done
+
+log "Limpiando métricas pendientes..."
+rm -rf /var/lib/rlink-reporte
+
+log "Limpiando logs de setup..."
+rm -f /var/log/rlink-setup.log
+
+log "Limpiando localStorage del navegador del kiosko (rladmin)..."
+rm -rf /home/rladmin/.config/chromium
+rm -rf /home/rladmin/.cache/chromium
+chown -R rladmin:rladmin /home/rladmin/.config /home/rladmin/.cache 2>/dev/null || true
+
+log "Limpiando portal cautivo de configuración..."
+rm -f /etc/NetworkManager/dnsmasq-shared.d/rlink-captive.conf
+
+cat <<EOF
+
+✓ Pi reset a estado de recién instalada.
+
+Próximo arranque:
+  - Se generará una clave de agente nueva
+  - NetworkManager no tendrá redes guardadas
+  - El modo será "setup" (si no detecta cable)
+  - Emitirá su propio Wi-Fi "Rlink-XXXX"
+
+Para terminar: sudo reboot
+
+EOF

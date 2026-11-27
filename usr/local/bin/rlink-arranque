@@ -1,0 +1,38 @@
+#!/bin/bash
+# /usr/local/bin/rlink-arranque — paso 4 del arranque: modo configuración o kiosco
+#
+# Lo lanza ~/.config/openbox/autostart (antes lanzaba kiosk.sh directo). Lee lo que decidió
+# rlink-setup (servicio de systemd, root) en /run/rlink-setup/modo:
+#   setup  muestra en pantalla completa la página de configuración (http://localhost/pantalla:
+#          nombre del Wi-Fi que emite la Pi, clave y QR para el celular) hasta que rlink-setup
+#          cambia el modo a kiosk.
+#   kiosk  (o nada después de 20 s, por ejemplo si rlink-setup no está instalado) → kiosk.sh.
+# Ver docs/plan-redes-wifi.md y /usr/local/bin/rlink-setup.
+
+MODO=/run/rlink-setup/modo
+modo() { cat "$MODO" 2>/dev/null; }
+
+for _ in $(seq 40); do
+  [ -s "$MODO" ] && break
+  sleep 0.5
+done
+
+if [ "$(modo)" = setup ]; then
+  xset s off; xset s noblank; xset -dpms
+  unclutter -idle 0.5 -root &
+  UNCLUTTER=$!
+  while [ "$(modo)" = setup ]; do
+    # Perfil aparte: no toca el del kiosco (su localStorage tiene la clave del equipo).
+    chromium --kiosk --user-data-dir=/tmp/rlink-setup-chromium --no-first-run \
+      --no-default-browser-check --disable-session-crashed-bubble --disable-infobars \
+      http://localhost/pantalla &
+    PID=$!
+    while [ "$(modo)" = setup ] && kill -0 "$PID" 2>/dev/null; do sleep 2; done
+    kill "$PID" 2>/dev/null
+    wait "$PID" 2>/dev/null
+    sleep 1
+  done
+  kill "$UNCLUTTER" 2>/dev/null  # kiosk.sh lanza el suyo
+fi
+
+exec "$HOME/kiosk.sh"

@@ -1,0 +1,78 @@
+#!/bin/bash
+# /usr/local/bin/rlink-limpiar — watchdog de espacio en disco
+#
+# Corre cada 10 min por rlink-limpiar.timer. Si el root esta por llenarse,
+# vacia el cache de Chromium (Service Worker + Code Cache) pero preserva el
+# Local Storage, que es donde vive la clave del device (device_secret y
+# agent_key). Asi la Pi se recupera sola sin perder la vinculacion.
+#
+# El servidor vuelve a mandar los videos/imagenes en el proximo syncOffline.
+#
+# Umbral configurable via /etc/default/rlink-limpiar (opcional):
+#   UMBRAL_MB=500   # limpia cuando queda menos
+#
+# Log:  journalctl -u rlink-limpiar.service
+
+set -u
+
+UMBRAL_MB=500
+[ -f /etc/default/rlink-limpiar ] && . /etc/default/rlink-limpiar
+
+CHROMIUM=/home/rladmin/.config/chromium
+PERFIL=$CHROMIUM/Default
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+libres_mb() {
+  df -m / | awk 'NR==2 {print $4}'
+}
+
+libres=$(libres_mb)
+log "espacio libre: ${libres} MB (umbral ${UMBRAL_MB} MB)"
+
+if [ "$libres" -ge "$UMBRAL_MB" ]; then
+  exit 0
+fi
+
+log "umbral superado, limpiando cache de Chromium..."
+
+# Lo que SI se borra, todo regenerable:
+# - BrowserMetrics, Crash Reports: telemetría. En una Pi de prueba se la vio
+#   crecer a 750 MB en pocas semanas. Es la mayor fuga en kioscos.
+# - Service Worker/*, Code Cache, GPUCache, Cache: cachés de red y JS/GPU.
+# - Dawn*: cachés de WebGPU.
+for sub in \
+  "BrowserMetrics" \
+  "Crash Reports" \
+  "Default/Service Worker/CacheStorage" \
+  "Default/Service Worker/ScriptCache" \
+  "Default/Code Cache" \
+  "Default/GPUCache" \
+  "Default/Cache" \
+  "Default/DawnWebGPUCache" \
+  "Default/DawnGraphiteCache" \
+  "Default/optimization_guide_prediction_model_downloads" \
+  "Default/shader_cache"
+do
+  ruta="$CHROMIUM/$sub"
+  if [ -d "$ruta" ]; then
+    tam=$(du -sm "$ruta" 2>/dev/null | awk '{print $1}')
+    rm -rf "$ruta"
+    log "  borrado $sub (${tam} MB)"
+  fi
+done
+
+# Lo que NUNCA se borra (contiene la vinculacion y preferencias):
+#   Local Storage/        ← device_secret, agent_key
+#   IndexedDB/            ← puede tener datos de la app
+#   Preferences           ← preferencias del perfil
+
+sync
+libres2=$(libres_mb)
+log "espacio libre tras limpieza: ${libres2} MB (recuperados $((libres2 - libres)) MB)"
+
+# Chromium puede quedar inconsistente con el cache borrado por abajo. Reiniciarlo
+# para que se regenere limpio. El loop de kiosk.sh lo vuelve a levantar.
+if pgrep -x chromium >/dev/null; then
+  log "reiniciando Chromium para que regenere el cache"
+  pkill -o chromium || true
+fi

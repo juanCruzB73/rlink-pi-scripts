@@ -1,0 +1,25 @@
+# /etc/systemd/system/rlink-cmd.service — agente de comandos MQTT para la Pi.
+#
+# Escucha pi/<agent_key>/cmd y pi/all/cmd, ejecuta comandos whitelistados (update, reboot,
+# restart-chromium, redownload-media, ping) y publica el ack. Ver /usr/local/bin/rlink-cmd.
+#
+# Instalar:  sudo systemctl daemon-reload && sudo systemctl enable --now rlink-cmd
+# Log:       journalctl -u rlink-cmd -f
+
+[Unit]
+Description=rlink-cmd: agente de comandos MQTT
+Wants=network-online.target rlink-reporte.service
+After=network-online.target rlink-reporte.service
+
+[Service]
+Type=simple
+Environment=RLINK_MQTT_HOST=carteleria.rlink.com.ar
+Environment=RLINK_MQTT_PORT=1883
+Environment=RLINK_SCRIPTS_DIR=/opt/rlink-scripts
+ExecStart=/usr/local/bin/rlink-cmd
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

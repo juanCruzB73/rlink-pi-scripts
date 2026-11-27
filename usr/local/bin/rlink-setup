@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+# /usr/local/bin/rlink-setup — modo configuración de red (etapa 2 de docs/plan-redes-wifi.md)
+#
+# Lo arranca systemd (rlink-setup.service, root) en cada arranque. Decide el modo y lo deja en
+# /run/rlink-setup/modo, que lee rlink-arranque (la sesión gráfica):
+#   kiosk   la Pi tiene redes guardadas: no hace nada más y termina.
+#   setup   la Pi nunca se configuró, o alguien lo forzó con el archivo rlink-setup en la
+#           partición de arranque (/boot/firmware/rlink-setup, se puede crear desde Windows
+#           poniendo la SD en la PC). El archivo se borra al leerlo: forzar vale un arranque.
+#
+# En modo configuración:
+#   1. Si no está forzado, prueba si ya llega al servidor (cable enchufado).
+#   2. Si hay /boot/firmware/rlink-wifi.txt (líneas "ssid=..." y "clave=..."), prueba esa red y
+#      borra el archivo (tiene una clave).
+#   3. Escanea las redes visibles. La Pi 4 tiene una sola radio: escanea antes de emitir.
+#   4. Emite el Wi-Fi "Rlink-XXXX" con una clave al azar. La pantalla (rlink-arranque abre
+#      http://localhost/pantalla) muestra nombre, clave y un QR para unirse con el celular.
+#   5. El celular se une y el sistema operativo abre solo el portal (portal cautivo: el dnsmasq
+#      de NetworkManager resuelve cualquier nombre a la Pi, y cualquier URL desconocida redirige
+#      al portal). Ahí se elige la red y se escribe la clave.
+#   6. Deja de emitir, se conecta y prueba llegar al servidor. Si anda, guarda la red y escribe
+#      modo=kiosk: rlink-arranque cierra la pantalla de configuración y arranca kiosk.sh. Si no
+#      anda, borra la red que creó, vuelve al paso 4 y muestra el motivo en la pantalla y en el
+#      portal.
+#
+# Forzado con redes guardadas: si en 15 min nadie usa el portal, deja de emitir, NetworkManager
+# vuelve solo a la red de siempre y la Pi sigue como kiosco. Así forzarlo a distancia nunca deja
+# la Pi incomunicada. Sin redes guardadas (Pi nueva) espera sin límite, y cada 30 s se fija si
+# apareció un cable.
+#
+# Log: journalctl -u rlink-setup, y /var/log/rlink-setup.log (sin claves).
+#
+# Probar el portal sin tocar la red (desde otra máquina, http://<ip-de-la-pi>:8080/):
+#   sudo RLINK_SETUP_SIMULAR=1 RLINK_SETUP_PORT=8080 RLINK_SETUP_RUN=/tmp/rlink-setup-sim rlink-setup
+# En simulación no emite, no se conecta a nada y no toca /run/rlink-setup. La clave "malaclave"
+# simula una clave incorrecta.
+
+import html
+import json
+import os
+import queue
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+SERVER = os.environ.get("RLINK_SERVER", "https://carteleria.rlink.com.ar")
+RUN_DIR = os.environ.get("RLINK_SETUP_RUN", "/run/rlink-setup")
+PORT = int(os.environ.get("RLINK_SETUP_PORT", "80"))
+SIMULAR = os.environ.get("RLINK_SETUP_SIMULAR") == "1"
+LOG_FILE = "/var/log/rlink-setup.log"
+FORCE_FILES = ["/boot/firmware/rlink-setup", "/boot/rlink-setup"]
+WIFI_FILES = ["/boot/firmware/rlink-wifi.txt", "/boot/rlink-wifi.txt"]
+CAPTIVE_CONF = "/etc/NetworkManager/dnsmasq-shared.d/rlink-captive.conf"
+HOTSPOT = "rlink-hotspot"
+RESCUE = "RLINK-SETUP"  # red de rescate (etapa 3): no cuenta como "configurada"
+IFACE = "wlan0"
+AP_IP = "10.42.0.1"  # la que usa NetworkManager en modo compartido
+FORCED_TIMEOUT = 15 * 60
+CABLE_CHECK_EVERY = 30
+# Sin 0/O ni 1/I: se leen de la pantalla y se tipean en un celular.
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+MESSAGES = {
+    "clave": "la clave es incorrecta",
+    "no_encontrada": "la Pi no encuentra esa red (¿está lejos o apagada?)",
+    "sin_internet": "se conecta, pero no llega a internet",
+    "no_conecta": "no se pudo conectar",
+}
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line, flush=True)
+    if not SIMULAR:
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def run(args, timeout=60):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def split_nmcli(line):
+    """nmcli -t separa con ':' y escapa los ':' del valor como '\\:'."""
+    fields, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    fields.append(cur)
+    return fields
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.version = 0
+        self.phase = "buscando"  # buscando, esperando, conectando, listo
+        self.ap_ssid = "Rlink-" + "".join(secrets.choice(ALPHABET) for _ in range(4))
+        self.ap_psk = "".join(secrets.choice(ALPHABET) for _ in range(8))
+        self.networks = []
+        self.target = ""
+        self.error = ""
+        self.forced = False
+        self.last_activity = time.time()
+        self.host = os.uname().nodename
+
+    def update(self, **kw):
+        with self.lock:
+            for k, v in kw.items():
+                setattr(self, k, v)
+            self.version += 1
+
+    def public(self):
+        with self.lock:
+            return {
+                "version": self.version, "phase": self.phase, "ap_ssid": self.ap_ssid,
+                "ap_psk": self.ap_psk, "target": self.target, "error": self.error,
+                "forced": self.forced, "host": self.host,
+            }
+
+
+state = State()
+actions = queue.Queue()
+hotspot_active = False
+
+
+def write_modo(modo):
+    os.makedirs(RUN_DIR, exist_ok=True)
+    tmp = os.path.join(RUN_DIR, "modo.tmp")
+    with open(tmp, "w") as f:
+        f.write(modo + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, os.path.join(RUN_DIR, "modo"))
+
+
+def consume_force():
+    forced = False
+    for path in FORCE_FILES:
+        if os.path.exists(path):
+            forced = True
+            try:
+                os.remove(path)
+            except OSError as e:
+                log(f"no se pudo borrar {path}: {e}")
+    return forced
+
+
+def wifi_profiles():
+    """Nombre → SSID de las redes Wi-Fi guardadas (sin la del modo configuración)."""
+    rc, out = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+    profiles = {}
+    for line in out.splitlines() if rc == 0 else []:
+        f = split_nmcli(line)
+        if len(f) >= 2 and f[1] == "802-11-wireless" and f[0] != HOTSPOT:
+            _, ssid = run(["nmcli", "-t", "-g", "802-11-wireless.ssid", "connection", "show", f[0]])
+            profiles[f[0]] = ssid
+    return profiles
+
+
+def configured_networks():
+    return [name for name, ssid in wifi_profiles().items() if ssid != RESCUE and name != RESCUE]
+
+
+def server_ok(timeout=8):
+    try:
+        with urllib.request.urlopen(SERVER + "/up", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def scan():
+    rc, out = run(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list",
+                   "ifname", IFACE, "--rescan", "no" if SIMULAR else "yes"], timeout=40)
+    best = {}
+    for line in out.splitlines() if rc == 0 else []:
+        f = split_nmcli(line)
+        if len(f) < 3 or not f[0] or f[0] == state.ap_ssid:
+            continue
+        signal_pct = int(f[1]) if f[1].isdigit() else 0
+        if f[0] not in best or signal_pct > best[f[0]]["signal"]:
+            best[f[0]] = {"ssid": f[0], "signal": signal_pct, "secure": f[2] not in ("", "--")}
+    nets = sorted(best.values(), key=lambda n: -n["signal"])
+    log(f"redes visibles: {len(nets)}")
+    state.update(networks=nets)
+
+
+def hotspot_up():
+    global hotspot_active
+    if SIMULAR:
+        hotspot_active = True
+        return True
+    # Todo nombre resuelve a la Pi: así el celular detecta el portal y lo abre solo.
+    os.makedirs(os.path.dirname(CAPTIVE_CONF), exist_ok=True)
+    with open(CAPTIVE_CONF, "w") as f:
+        f.write(f"# rlink-setup: portal cautivo, solo mientras está el modo configuración\naddress=/#/{AP_IP}\n")
+    run(["nmcli", "connection", "delete", HOTSPOT])
+    rc, out = run(["nmcli", "connection", "add", "type", "wifi", "ifname", IFACE, "con-name", HOTSPOT,
+                   "autoconnect", "no", "ssid", state.ap_ssid,
+                   "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+                   "ipv4.method", "shared", "ipv6.method", "disabled",
+                   "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", state.ap_psk,
+                   "wifi-sec.proto", "rsn", "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp"])
+    if rc != 0:
+        log(f"no se pudo crear el hotspot: {out}")
+        return False
+    rc, out = run(["nmcli", "--wait", "30", "connection", "up", HOTSPOT], timeout=45)
+    if rc != 0:
+        log(f"no se pudo levantar el hotspot: {out}")
+        return False
+    hotspot_active = True
+    log(f"emitiendo {state.ap_ssid}")
+    return True
+
+
+def hotspot_down():
+    global hotspot_active
+    if not SIMULAR:
+        log("Bajando hotspot (nmcli connection down)...")
+        rc, out = run(["nmcli", "connection", "down", HOTSPOT], timeout=20)
+        if rc != 0:
+            log(f"  advertencia (down): {out[:100]}")
+        log("Borrando conexión de hotspot...")
+        rc, out = run(["nmcli", "connection", "delete", HOTSPOT])
+        if rc != 0:
+            log(f"  advertencia (delete): {out[:100]}")
+        try:
+            os.remove(CAPTIVE_CONF)
+            log("Borrado archivo de portal cautivo")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f"  error al borrar {CAPTIVE_CONF}: {e}")
+    if hotspot_active:
+        log("dejó de emitir")
+    hotspot_active = False
+
+
+def classify(out):
+    low = out.lower()
+    if "secrets were required" in low or "802-11-wireless-security" in low or "psk" in low:
+        return "clave"
+    if "no network with ssid" in low or "not found" in low:
+        return "no_encontrada"
+    return "no_conecta"
+
+
+def connect(ssid, psk):
+    """Crea un perfil para la red y lo prueba. Devuelve None si anda, o el motivo si no."""
+    if SIMULAR:
+        time.sleep(3)
+        return "clave" if psk == "malaclave" else None
+
+    name = ("rlink-" + ssid)[:60]
+    before = wifi_profiles()
+    run(["nmcli", "connection", "delete", name])
+    cmd = ["nmcli", "connection", "add", "type", "wifi", "ifname", IFACE, "con-name", name,
+           "ssid", ssid, "autoconnect", "yes", "connection.autoconnect-priority", "10"]
+    if psk:
+        cmd += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
+    rc, out = run(cmd)
+    if rc != 0:
+        log(f"no se pudo crear el perfil: {out}")
+        return "no_conecta"
+    rc, out = run(["nmcli", "--wait", "45", "connection", "up", name], timeout=60)
+    reason = None
+    if rc != 0:
+        reason = classify(out)
+        log(f"no conectó a la red elegida ({reason}): {out[:200]}")
+    else:
+        deadline = time.time() + 30
+        while not server_ok() and time.time() < deadline:
+            time.sleep(3)
+        if not server_ok():
+            reason = "sin_internet"
+    if reason:
+        run(["nmcli", "connection", "delete", name])
+        return reason
+    # La red nueva anda: los perfiles viejos de la misma red (con otra clave) sobran.
+    for old, old_ssid in before.items():
+        if old != name and old_ssid == ssid:
+            run(["nmcli", "connection", "delete", old])
+            log(f"borrado el perfil viejo {old}")
+    return None
+
+
+def try_wifi_file():
+    for path in WIFI_FILES:
+        if not os.path.exists(path):
+            continue
+        data = {}
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        data[k.strip().lower()] = v.strip()
+        except OSError as e:
+            log(f"no se pudo leer {path}: {e}")
+        try:
+            os.remove(path)  # tiene una clave: no queda en la SD
+        except OSError:
+            pass
+        ssid = data.get("ssid", "")
+        if not ssid:
+            log(f"{path} sin ssid=")
+            continue
+        log(f"probando la red de {path}")
+        state.update(phase="conectando", target=ssid, error="")
+        reason = connect(ssid, data.get("clave", data.get("password", "")))
+        if reason is None:
+            return True
+        state.update(phase="buscando", error=f"{ssid}: {MESSAGES[reason]}")
+    return False
+
+
+def finish(why):
+    log(f"listo: {why}")
+    state.update(phase="listo", error="")
+    time.sleep(5)  # que la pantalla y el celular alcancen a mostrar "listo"
+    if not SIMULAR:
+        log("ESCRIBIENDO MODO KIOSK...")
+        write_modo("kiosk")
+        log("MODO KIOSK ESCRITO EXITOSAMENTE")
+        # Verificación: leer de vuelta para confirmar
+        try:
+            with open(os.path.join(RUN_DIR, "modo"), "r") as f:
+                modo_verificado = f.read().strip()
+            log(f"VERIFICACIÓN: modo contiene: '{modo_verificado}'")
+        except Exception as e:
+            log(f"ERROR AL VERIFICAR: {e}")
+
+
+def leave_forced():
+    """Forzado y nadie lo usó: vuelve la red de siempre (NetworkManager se reconecta solo)."""
+    log("forzado sin uso por 15 min: vuelve al kiosco con la red guardada")
+    hotspot_down()
+    write_modo("kiosk")
+
+
+# ---------------------------------------------------------------- páginas
+
+STYLE = """
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+background:#f3f3f1;color:#1a1a1a}main{max-width:560px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:4px 0 14px}.err{background:#fde8e6;border-left:4px solid #e2341d;padding:10px 12px;margin:12px 0}
+.ok{background:#e7f3e9;border-left:4px solid #2b8a3e;padding:10px 12px;margin:12px 0}
+.net{display:flex;align-items:center;gap:10px;padding:12px;border:1px solid #d6d6d2;background:#fff;margin:-1px 0 0}
+.net input{width:20px;height:20px}.net span{flex:1;font-size:16px;word-break:break-all}.sig{color:#666;font-size:13px}
+label.f{display:block;margin:16px 0 6px;font-weight:600}input[type=text],input[type=password]{width:100%;font-size:17px;padding:11px;border:1px solid #bbb}
+button{width:100%;font-size:17px;padding:13px;margin-top:16px;border:0;background:#e2341d;color:#fff;font-weight:700}
+button.sec{background:#fff;color:#1a1a1a;border:1px solid #bbb}.hint{color:#555;font-size:13px}
+"""
+
+
+def page(title, body, refresh=None):
+    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    return (f'<!doctype html><html lang="es"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">{meta}'
+            f"<title>{html.escape(title)}</title><style>{STYLE}</style></head>"
+            f"<body><main>{body}</main></body></html>")
+
+
+def signal_label(pct):
+    return "muy buena" if pct >= 70 else "buena" if pct >= 50 else "regular" if pct >= 30 else "débil"
+
+
+def portal_page():
+    s = state.public()
+    if s["phase"] == "conectando":
+        return page("Conectando", f'<h1>Conectando a «{html.escape(s["target"])}»…</h1>'
+                    "<p>La Pi dejó de emitir su Wi-Fi para probar la red, así que este celular se va a "
+                    "desconectar. Mirá la pantalla: si algo falla, la Pi vuelve a emitir y podés "
+                    "reintentar.</p>", refresh=5)
+    if s["phase"] == "listo":
+        return page("Listo", '<h1>Listo</h1><div class="ok">La Pi quedó conectada. Ya podés cerrar esto.</div>')
+    err = f'<div class="err">No se pudo conectar a {html.escape(s["error"])}. Probá de nuevo.</div>' if s["error"] else ""
+    with state.lock:
+        nets = list(state.networks)
+    rows = "".join(
+        f'<label class="net"><input type="radio" name="ssid" value="{html.escape(n["ssid"], quote=True)}"'
+        f'{" checked" if i == 0 else ""}><span>{html.escape(n["ssid"])}{" 🔒" if n["secure"] else ""}</span>'
+        f'<span class="sig">señal {signal_label(n["signal"])}</span></label>'
+        for i, n in enumerate(nets)) or '<p class="hint">No se encontraron redes. Volvé a buscar o escribí el nombre abajo.</p>'
+    body = f"""
+<h1>Red Wi-Fi de {html.escape(s["host"])}</h1>{err}
+<form method="post" action="/conectar">
+  {rows}
+  <label class="f" for="otra">¿No está en la lista? Nombre de la red</label>
+  <input type="text" id="otra" name="otra" autocomplete="off" autocapitalize="none" placeholder="Solo si es una red oculta">
+  <label class="f" for="clave">Clave</label>
+  <input type="password" id="clave" name="clave" autocomplete="off" placeholder="Vacía si la red es abierta">
+  <button type="submit">Conectar</button>
+</form>
+<form method="post" action="/buscar">
+  <button class="sec" type="submit">Volver a buscar redes</button>
+  <p class="hint">La Pi deja de emitir unos segundos: el celular se desconecta y hay que volver a unirse a
+  {html.escape(s["ap_ssid"])}.</p>
+</form>"""
+    return page("Configurar red", body)
+
+
+def qr_svg(text):
+    rc, out = run(["qrencode", "-t", "SVG", "-m", "1", "-o", "-", text], timeout=10)
+    return out[out.find("<svg"):] if rc == 0 and "<svg" in out else ""
+
+
+def wifi_qr_text(ssid, psk):
+    esc = lambda v: "".join("\\" + c if c in '\\;,:"' else c for c in v)
+    return f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(psk)};;"
+
+
+def screen_page():
+    s = state.public()
+    ssid, psk = html.escape(s["ap_ssid"]), html.escape(s["ap_psk"])
+    if s["phase"] == "listo":
+        status = '<p class="big ok">Conectada. Arrancando la cartelería…</p>'
+    elif s["phase"] == "conectando":
+        status = f'<p class="big">Probando la red «{html.escape(s["target"])}»…</p>'
+    elif s["phase"] == "buscando":
+        status = '<p class="big">Buscando redes…</p>'
+    else:
+        status = ""
+    err = f'<p class="big err">No se pudo conectar a {html.escape(s["error"])}. Probá de nuevo desde el celular.</p>' if s["error"] and s["phase"] == "esperando" else ""
+    forced = ('<p class="small">Modo configuración forzado: si nadie configura nada en 15 minutos, la Pi vuelve '
+              "sola a su red de siempre.</p>") if s["forced"] else ""
+    steps = ""
+    if s["phase"] == "esperando":
+        steps = f"""
+<div class="cols">
+  <div class="qr">{qr_svg(wifi_qr_text(s["ap_ssid"], s["ap_psk"]))}</div>
+  <ol>
+    <li>Con el celular, escaneá el código con la cámara.<br><span class="small">O conectate a la red
+      <b>{ssid}</b> con la clave <b class="mono">{psk}</b>.</span></li>
+    <li>Se abre una página: elegí la red Wi-Fi del local y escribí su clave.<br><span class="small">Si no se
+      abre sola, entrá a <b>http://{AP_IP}</b>.</span></li>
+    <li>La pantalla va a decir si se pudo conectar.</li>
+  </ol>
+</div>"""
+    css = """body{margin:0;background:#111;color:#f3f3f1;font-family:system-ui,sans-serif}
+main{padding:5vh 6vw}h1{font-size:5vh;margin:0 0 3vh}.big{font-size:3.4vh}.small{font-size:2.3vh;color:#bbb}
+.err{color:#ff8a7a}.ok{color:#8fdc9a}.cols{display:flex;gap:5vw;align-items:center}
+.qr{background:#fff;padding:2vh;width:40vh;height:40vh;flex:none}.qr svg{width:100%;height:100%}
+ol{font-size:3.2vh;line-height:1.45}li{margin-bottom:3vh}.mono{font-family:ui-monospace,monospace;letter-spacing:.15em}
+.host{position:fixed;bottom:3vh;right:4vw;font-size:2vh;color:#888}"""
+    script = f"""<script>
+const v={s["version"]};setInterval(async()=>{{try{{const r=await fetch('/estado.json',{{cache:'no-store'}});
+const j=await r.json();if(j.version!==v)location.reload()}}catch(e){{}}}},2000)</script>"""
+    return (f'<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Configuración de red</title>'
+            f"<style>{css}</style></head><body><main><h1>Configuración de red</h1>{status}{err}{steps}{forced}"
+            f'</main><div class="host">{html.escape(s["host"])}</div>{script}</body></html>')
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "rlink-setup"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def from_phone(self):
+        return self.client_address[0] not in ("127.0.0.1", "::1")
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def to_portal(self):
+        # Cualquier URL que no sea del portal (las de prueba de Android e iOS incluidas) lleva al
+        # portal: así el celular detecta que hay que "iniciar sesión" en esta red y lo abre solo.
+        host = self.headers.get("Host", "")
+        target = "/" if host.startswith(("localhost", "127.0.0.1")) or SIMULAR else f"http://{AP_IP}/"
+        self.send(302, "", headers={"Location": target})
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if self.from_phone():
+            state.last_activity = time.time()
+        if path == "/pantalla":
+            self.send(200, screen_page())
+        elif path == "/estado.json":
+            self.send(200, json.dumps(state.public()), "application/json")
+        elif path == "/":
+            self.send(200, portal_page())
+        else:
+            self.to_portal()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        length = min(int(self.headers.get("Content-Length") or 0), 4096)
+        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        state.last_activity = time.time()
+        if path == "/conectar":
+            ssid = (form.get("otra", [""])[0].strip() or form.get("ssid", [""])[0])
+            psk = form.get("clave", [""])[0]
+            if not ssid or len(ssid.encode()) > 32:
+                state.update(error="(ninguna red): elegí una red de la lista o escribí su nombre")
+            elif psk and not (8 <= len(psk) <= 63):
+                state.update(error=f"{ssid}: la clave tiene que tener entre 8 y 63 caracteres")
+            else:
+                state.update(phase="conectando", target=ssid, error="")
+                actions.put(("conectar", ssid, psk))
+            self.send(303, "", headers={"Location": "/"})
+        elif path == "/buscar":
+            actions.put(("buscar",))
+            self.send(200, page("Buscando", "<h1>Buscando redes…</h1><p>La Pi deja de emitir unos segundos. "
+                                "Volvé a unirte a <b>" + html.escape(state.ap_ssid) + "</b> en un momento.</p>"))
+        else:
+            self.to_portal()
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    log(f"portal en el puerto {PORT}")
+    return httpd
+
+
+def setup_loop():
+    """Escanear → emitir → esperar al celular. Termina cuando la Pi queda conectada."""
+    log("ENTRANDO A setup_loop()")
+    last_cable_check = time.time()
+    while True:
+        state.update(phase="buscando")
+        hotspot_down()
+        scan()
+        if not hotspot_up():
+            time.sleep(10)
+            continue
+        state.update(phase="esperando")
+        while True:
+            try:
+                action = actions.get(timeout=5)
+            except queue.Empty:
+                action = None
+            if action is None:
+                if state.forced and time.time() - state.last_activity > FORCED_TIMEOUT:
+                    leave_forced()
+                    return
+                if not state.forced and time.time() - last_cable_check > CABLE_CHECK_EVERY:
+                    last_cable_check = time.time()
+                    if not SIMULAR and server_ok(timeout=4):
+                        hotspot_down()
+                        finish("llega al servidor (cable)")
+                        return
+                continue
+            if action[0] == "buscar":
+                break  # vuelve a escanear y a emitir
+            if action[0] == "conectar":
+                _, ssid, psk = action
+                log(f"probando la red elegida en el portal: {ssid}")
+                hotspot_down()
+                log(f"hotspot cerrado, conectando a {ssid}...")
+                reason = connect(ssid, psk)
+                log(f"resultado de connect(): {reason}")
+                if reason is None:
+                    log("LLAMANDO A finish()...")
+                    finish(f"conectada a {ssid}")
+                    log("finish() completó, saliendo de setup_loop()")
+                    return
+                log(f"error de conexión: {reason}")
+                state.update(error=f"{ssid}: {MESSAGES[reason]}", target=ssid)
+                break  # vuelve a emitir con el error a la vista
+
+
+def cleanup(*_):
+    if hotspot_active:
+        hotspot_down()
+    sys.exit(0)
+
+
+def main():
+    signal.signal(signal.SIGTERM, cleanup)
+    if SIMULAR:
+        log("SIMULACIÓN: no emite ni se conecta")
+        state.update(forced=True)
+        httpd = serve()
+        scan()
+        state.update(phase="esperando")
+        while True:
+            action = actions.get()
+            if action[0] == "conectar":
+                reason = connect(action[1], action[2])
+                state.update(phase="listo" if reason is None else "esperando",
+                             error="" if reason is None else f"{action[1]}: {MESSAGES[reason]}")
+            else:
+                scan()
+                state.update(phase="esperando")
+
+    forced = consume_force()
+    configured = configured_networks()
+    if not forced and configured:
+        write_modo("kiosk")
+        log(f"redes guardadas ({len(configured)}): kiosco")
+        return
+    write_modo("setup")
+    # Con a dónde volver, forzarlo tiene límite de tiempo. Una Pi nueva espera sin límite.
+    state.update(forced=forced and bool(configured))
+    log("modo configuración " + ("(forzado)" if forced else "(sin redes guardadas)"))
+    serve()
+    try:
+        if not forced and server_ok():
+            finish("ya llega al servidor (cable)")
+            return
+        if try_wifi_file():
+            finish("conectada con rlink-wifi.txt")
+            return
+        setup_loop()
+    finally:
+        if hotspot_active:
+            hotspot_down()
+
+
+if __name__ == "__main__":
+    main()

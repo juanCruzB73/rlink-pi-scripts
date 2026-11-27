@@ -1,0 +1,25 @@
+# /etc/systemd/system/dex-reporte.service — agente que reporta el estado de la Pi al admin
+#
+# Corre aparte del kiosko (no depende de X ni de Chromium), así sigue reportando aunque la
+# parte gráfica se caiga, que es justo cuando más interesa. Ver /usr/local/bin/dex-reporte.
+#
+# Instalar:  sudo systemctl daemon-reload && sudo systemctl enable --now dex-reporte
+# Log:       journalctl -u dex-reporte -f
+
+[Unit]
+Description=dex-reporte: métricas de la Pi para el admin de cartelería
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=DEX_SERVER=https://carteleria.rlink.com.ar
+Environment=INTERVALO=60
+ExecStart=/usr/local/bin/dex-reporte
+Restart=always
+RestartSec=10
+# Que nunca le quite CPU a la reproducción.
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

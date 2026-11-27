@@ -1,0 +1,149 @@
+#!/bin/bash
+# /usr/local/bin/rlink-reporte — agente que reporta al admin el estado de la Pi
+#
+# Cada INTERVALO segundos (60 por defecto) toma una muestra y la manda al servidor, que la
+# guarda por equipo y la muestra en Admin → Dispositivos (gráficos de memoria, temperatura y
+# CPU, alertas). Mide lo mismo que rlink-medir, en kB como /proc/meminfo:
+#   mem_available_kb   memoria disponible (criterio: nunca < 200 MB)
+#   swap_used_kb       swap en uso (zram)
+#   cma_free_kb        memoria libre para GPU y decodificador de video
+#   chromium_pss_kb    RAM real de todos los procesos de Chromium
+#   cpu_pct            CPU promedio desde la muestra anterior
+#   temp_c, throttled  temperatura del SoC y vcgencmd get_throttled (0x0 = todo bien)
+#   uptime_s           segundos desde que arrancó la Pi
+#   chromium_uptime_s  segundos desde que arrancó el Chromium más viejo; vacío si no corre.
+#                      Si baja de una muestra a otra, Chromium se reinició.
+#   net_type           por dónde sale la ruta por defecto: wifi, ethernet o none (sin red)
+#   wifi_ssid          la red Wi-Fi a la que está conectada (nmcli), si sale por Wi-Fi
+#   wifi_signal_dbm    señal de esa red en dBm (/proc/net/wireless): -50 es muy buena, -70 floja
+#   connectivity       lo que dice NetworkManager: full (hay internet), limited, portal, none
+#                      (vacío si no hay NetworkManager). Las muestras se guardan aunque no haya
+#                      red, así que en el admin se ve también cuándo se cortó.
+#
+# Identidad: la primera vez genera /etc/rlink-agent-key (48 caracteres hex, legible por todos).
+# kiosk.sh la pasa a la página en ?agent=, y así el servidor sabe que este agente y el navegador
+# son el mismo equipo. Si el agente reporta antes de que el navegador se vincule, el equipo
+# aparece igual en la lista, sin pantalla.
+#
+# Sin red no pierde nada: cada muestra va primero a PENDIENTES y se borra recién cuando el
+# servidor confirma. Al volver la conexión manda lo acumulado de a 500. Guarda como máximo una
+# semana (10.080 muestras a 1 por minuto); lo más viejo se descarta.
+#
+# Corre como root (para leer la memoria de procesos de otros usuarios) desde systemd:
+#   /etc/systemd/system/rlink-reporte.service
+# Ver el log:      journalctl -u rlink-reporte -f
+# Probar a mano:   sudo INTERVALO=10 rlink-reporte
+#
+# Configuración (variables de entorno, ver el .service):
+#   RLINK_SERVER   https://carteleria.rlink.com.ar
+#   INTERVALO    segundos entre muestras (60)
+#   RLINK_REPORTE_DIR  dónde guarda lo pendiente (/var/lib/rlink-reporte); otro sirve para probar
+#                contra otro servidor sin tocar lo que junta el servicio
+
+RLINK_SERVER=${RLINK_SERVER:-https://carteleria.rlink.com.ar}
+INTERVALO=${INTERVALO:-60}
+KEY_FILE=/etc/rlink-agent-key
+DIR=${RLINK_REPORTE_DIR:-/var/lib/rlink-reporte}
+PENDIENTES=$DIR/pendientes.jsonl
+MAX_PENDIENTES=10080
+LOTE=500
+
+mkdir -p "$DIR"
+
+# Clave del agente: se genera una sola vez y no cambia más (si cambia, el servidor lo toma
+# como otro equipo).
+if [ ! -s "$KEY_FILE" ]; then
+  head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$KEY_FILE"
+  chmod 644 "$KEY_FILE"
+fi
+KEY=$(cat "$KEY_FILE")
+
+meminfo() { awk -v k="$1:" '$1==k {print $2}' /proc/meminfo; }
+
+# Un valor que no se pudo leer va como null, para que el JSON siga siendo válido.
+nz() { echo "${1:-null}"; }
+
+# Suma la PSS (kB) de todos los procesos cuya línea de comando contiene $1.
+pss() {
+  local total=0 v
+  for pid in $(pgrep -f "$1"); do
+    v=$(awk '/^Pss:/ {print $2}' "/proc/$pid/smaps_rollup" 2>/dev/null)
+    total=$((total + ${v:-0}))
+  done
+  echo "$total"
+}
+
+# Jiffies ocupados y ociosos del total de CPUs.
+cpu() { awk '/^cpu / {print $2+$3+$4+$7+$8+$9, $5+$6}' /proc/stat; }
+
+# Segundos desde que arrancó el Chromium más viejo (el proceso principal), o vacío.
+chromium_uptime() {
+  local pid
+  pid=$(pgrep -o -x chromium)
+  [ -n "$pid" ] && ps -o etimes= -p "$pid" | tr -d ' '
+}
+
+# Escapa comillas y barras para meter un texto (el nombre de la red) en el JSON.
+json_str() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Lo de la red: tipo de salida, SSID, señal y conectividad, ya como campos JSON.
+red() {
+  local iface tipo=none ssid="" dbm="" conn=""
+  iface=$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+  case "$iface" in
+    wl*) tipo=wifi ;;
+    "") tipo=none ;;
+    *) tipo=ethernet ;;
+  esac
+  if [ "$tipo" = wifi ]; then
+    # --rescan no: usa lo que ya sabe, sin escanear cada minuto.
+    ssid=$(nmcli -t -f ACTIVE,SSID dev wifi list --rescan no 2>/dev/null | awk -F: '$1 == "yes" {sub(/^yes:/, ""); print; exit}')
+    dbm=$(awk -v i="$iface:" '$1 == i {print int($4)}' /proc/net/wireless)
+  fi
+  command -v nmcli >/dev/null && conn=$(nmcli -t networking connectivity 2>/dev/null)
+  printf '"net_type":"%s","wifi_ssid":"%s","wifi_signal_dbm":%s,"connectivity":"%s"' \
+    "$tipo" "$(json_str "$ssid")" "$(nz "$dbm")" "$(json_str "$conn")"
+}
+
+muestra() {
+  local ocup1 ocio1 d_ocup d_ocio pct swap temp thr
+  read -r ocup1 ocio1 < <(cpu)
+  d_ocup=$((ocup1 - ocup0)); d_ocio=$((ocio1 - ocio0))
+  pct=$(( (d_ocup + d_ocio) > 0 ? 100 * d_ocup / (d_ocup + d_ocio) : 0 ))
+  ocup0=$ocup1; ocio0=$ocio1
+  swap=$(( $(meminfo SwapTotal) - $(meminfo SwapFree) ))
+  temp=$(vcgencmd measure_temp 2>/dev/null | grep -oE '[0-9.]+')
+  thr=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+  printf '{"t":"%s","mem_available_kb":%s,"swap_used_kb":%s,"cma_free_kb":%s,"chromium_pss_kb":%s,"cpu_pct":%s,"temp_c":%s,"throttled":"%s","uptime_s":%s,"chromium_uptime_s":%s,%s}\n' \
+    "$(date -Iseconds)" "$(nz "$(meminfo MemAvailable)")" "$swap" "$(nz "$(meminfo CmaFree)")" "$(pss chromium)" \
+    "$pct" "$(nz "$temp")" "$thr" "$(cut -d. -f1 /proc/uptime)" "$(nz "$(chromium_uptime)")" "$(red)"
+}
+
+# Manda hasta LOTE muestras pendientes; si el servidor responde 2xx, las saca del archivo.
+enviar() {
+  [ -s "$PENDIENTES" ] || return 0
+  local n cuerpo codigo
+  n=$(head -n "$LOTE" "$PENDIENTES" | wc -l)
+  cuerpo=$(printf '{"host":"%s","samples":[%s]}' "$(hostname)" "$(head -n "$LOTE" "$PENDIENTES" | paste -sd, -)")
+  codigo=$(curl -sS -o /dev/null -w '%{http_code}' -m 30 -X POST \
+    -H "Content-Type: application/json" -H "X-Agent-Key: $KEY" \
+    --data-binary "$cuerpo" "$RLINK_SERVER/player/agent/metrics" 2>/dev/null)
+  if [[ "$codigo" == 2* ]]; then
+    sed -i "1,${n}d" "$PENDIENTES"
+    return 0
+  fi
+  echo "envío fallido (HTTP ${codigo:-sin respuesta}), $(wc -l < "$PENDIENTES") muestras pendientes"
+  return 1
+}
+
+read -r ocup0 ocio0 < <(cpu)
+while true; do
+  sleep "$INTERVALO"
+  muestra >> "$PENDIENTES"
+  # Una semana como máximo: si el servidor no responde por días, se pierde lo más viejo.
+  if [ "$(wc -l < "$PENDIENTES")" -gt "$MAX_PENDIENTES" ]; then
+    tail -n "$MAX_PENDIENTES" "$PENDIENTES" > "$PENDIENTES.tmp" && mv "$PENDIENTES.tmp" "$PENDIENTES"
+  fi
+  # Después de un corte puede haber varios lotes: se mandan todos mientras el servidor responda.
+  while [ "$(wc -l < "$PENDIENTES")" -gt 0 ] && enviar; do :; done
+done

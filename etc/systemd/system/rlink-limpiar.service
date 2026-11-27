@@ -1,0 +1,9 @@
+[Unit]
+Description=rlink-limpiar: watchdog de disco (cache de Chromium) para prevenir SD llena
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rlink-limpiar
+StandardOutput=journal
+StandardError=journal

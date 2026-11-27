@@ -1,0 +1,13 @@
+# ~/.config/openbox/autostart — paso 3 del arranque del kiosko
+#
+# Openbox ejecuta este archivo al iniciar la sesión gráfica.
+# Lanza el kiosko en segundo plano (`&`) para no bloquear a Openbox:
+# rlink-arranque elige entre el modo configuración de red y kiosk.sh (un loop infinito).
+
+# Evitar que X apague la pantalla por idle: si DPMS se dispara y la tele
+# entra en standby, al despertar puede no renegociar HDMI y queda "sin señal".
+xset s off
+xset -dpms
+xset s noblank
+
+/usr/local/bin/rlink-arranque &

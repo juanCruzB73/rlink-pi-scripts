@@ -1,0 +1,63 @@
+#!/bin/bash
+# /usr/local/bin/rlink-medir — registro de consumo para la prueba de la Pi 4 de 1 GB
+#
+# Cada INTERVALO segundos (10 por defecto) agrega una línea al CSV con:
+#   fecha             hora de la muestra (ISO 8601)
+#   mem_available_kb  memoria que el sistema puede dar sin swappear. Es LA métrica:
+#                     el criterio de la prueba es que nunca baje de 200 MB
+#   swap_usada_kb     swap en uso (en esta Pi es zram: RAM comprimida, no disco)
+#   cma_total_kb      memoria reservada para GPU y decodificador de video
+#   cma_free_kb       la parte libre de esa reserva; si llega a 0, falla el video
+#   pss_chromium_kb   RAM real de todos los procesos de Chromium sumados
+#   pss_xorg_kb       RAM real de X
+#   pss_sidecar_kb    RAM real del sidecar (0 en la prueba web, porque no corre)
+#   cpu_pct           uso de CPU promedio del intervalo, todos los núcleos
+#   temp_c            temperatura del SoC
+#   throttled         estado de vcgencmd get_throttled; 0x0 = sin bajas de
+#                     frecuencia ni de voltaje
+#
+# PSS (y no RSS) reparte la memoria compartida entre los procesos que la usan,
+# así que sumar la PSS de los procesos de Chromium no cuenta dos veces lo mismo.
+#
+# Uso:   sudo rlink-medir [salida.csv]
+#        (sudo, para poder leer la memoria de procesos de otros usuarios)
+#        Sin argumento escribe en /var/tmp/medicion-AAAAMMDD-HHMM.csv.
+# Cambiar el intervalo: sudo INTERVALO=30 rlink-medir salida.csv
+#
+# Corre hasta que se lo corta (Ctrl+C o pkill -f rlink-medir). No arranca solo
+# después de reiniciar la Pi. Para dejarlo corriendo sin una sesión abierta:
+#   sudo bash -c "nohup setsid rlink-medir /var/tmp/E8.csv >/dev/null 2>&1 &"
+#
+# Copia del script de docs/medicion-pi4-1gb.md §4.1. Este encabezado de
+# comentarios no está en la Pi; el código es el mismo.
+INTERVALO=${INTERVALO:-10}
+SALIDA=${1:-/var/tmp/medicion-$(date +%Y%m%d-%H%M).csv}
+
+meminfo() { awk -v k="$1:" '$1==k {print $2}' /proc/meminfo; }
+
+# Suma la PSS (kB) de todos los procesos cuya línea de comando contiene $1.
+pss() {
+  local total=0 v
+  for pid in $(pgrep -f "$1"); do
+    v=$(awk '/^Pss:/ {print $2}' "/proc/$pid/smaps_rollup" 2>/dev/null)
+    total=$((total + ${v:-0}))
+  done
+  echo "$total"
+}
+
+# Jiffies ocupados y ociosos del total de CPUs.
+cpu() { awk '/^cpu / {print $2+$3+$4+$7+$8+$9, $5+$6}' /proc/stat; }
+
+echo "fecha,mem_available_kb,swap_usada_kb,cma_total_kb,cma_free_kb,pss_chromium_kb,pss_xorg_kb,pss_sidecar_kb,cpu_pct,temp_c,throttled" > "$SALIDA"
+read -r ocup0 ocio0 < <(cpu)
+while true; do
+  sleep "$INTERVALO"
+  read -r ocup1 ocio1 < <(cpu)
+  d_ocup=$((ocup1 - ocup0)); d_ocio=$((ocio1 - ocio0))
+  pct=$((100 * d_ocup / (d_ocup + d_ocio)))
+  ocup0=$ocup1; ocio0=$ocio1
+  swap=$(( $(meminfo SwapTotal) - $(meminfo SwapFree) ))
+  temp=$(vcgencmd measure_temp | grep -oE '[0-9.]+')
+  thr=$(vcgencmd get_throttled | cut -d= -f2)
+  echo "$(date -Iseconds),$(meminfo MemAvailable),$swap,$(meminfo CmaTotal),$(meminfo CmaFree),$(pss chromium),$(pss Xorg),$(pss rlink-sidecar),$pct,$temp,$thr" >> "$SALIDA"
+done

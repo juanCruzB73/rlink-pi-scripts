@@ -1,0 +1,17 @@
+# dex-setup: decide en cada arranque si la Pi va al kiosco o al modo configuración de red, y en
+# ese modo emite su propio Wi-Fi y sirve el portal para el celular. Ver /usr/local/bin/dex-setup.
+[Unit]
+Description=dex-setup: modo configuración de red de la Pi (Wi-Fi propio y portal para el celular)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dex-setup
+# Red de seguridad si el proceso muere emitiendo: sin esto la Pi no vuelve a su red.
+ExecStopPost=-/usr/bin/nmcli connection delete dex-hotspot
+ExecStopPost=-/bin/rm -f /etc/NetworkManager/dnsmasq-shared.d/dex-captive.conf
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
