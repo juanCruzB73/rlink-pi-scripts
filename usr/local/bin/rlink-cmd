@@ -102,10 +102,15 @@ run_cmd() {
         return 0
       fi
       echo "actualizado $before → $after"
-      if [ -x "$RLINK_SCRIPTS_DIR/install.sh" ]; then
-        echo "corriendo install.sh"
-        "$RLINK_SCRIPTS_DIR/install.sh" 2>&1 | tail -n 40
-      fi
+      # install.sh puede estar en la raíz del repo (pi-scripts-rlink/) o en pi-scripts/ si el
+      # repo que se clonó es dex_admin completo. Probamos los dos.
+      for candidate in "$RLINK_SCRIPTS_DIR/install.sh" "$RLINK_SCRIPTS_DIR/pi-scripts/install.sh"; do
+        if [ -x "$candidate" ]; then
+          echo "corriendo $candidate"
+          "$candidate" 2>&1 | tail -n 40
+          break
+        fi
+      done
       return 0
       ;;
     reboot)
@@ -171,8 +176,11 @@ handle_message() {
   publish "$TOPIC_ACK" "$ack"
 }
 
-# Marcamos presencia al conectar y dejamos LWT para avisar si nos caemos.
-# mosquitto_sub publica el will cuando pierde conexión, y sube "online" retained al reconectar.
+# Marcamos presencia ANTES de arrancar el sub: si lo hiciéramos dentro del while, no se publica
+# hasta el primer mensaje entrante y en una Pi recién arrancada eso puede no pasar nunca. El LWT
+# del sub (configurado abajo) se encarga de avisar "offline" cuando esta sesión se caiga.
+publish "$TOPIC_STATUS" "online" retain
+
 echo "rlink-cmd: suscribiendo a $TOPIC_CMD y $TOPIC_ALL (broker $RLINK_MQTT_HOST:$RLINK_MQTT_PORT)"
 
 mosquitto_sub \
@@ -182,13 +190,10 @@ mosquitto_sub \
   -F '%t %p' \
   --will-topic "$TOPIC_STATUS" --will-payload "offline" --will-qos 1 --will-retain \
   | while IFS= read -r line; do
-      # Publicar "online" (retained) la primera vez que podemos — después de la primera suscripción.
-      if [ -z "${ANNOUNCED:-}" ]; then
-        publish "$TOPIC_STATUS" "online" retain
-        ANNOUNCED=1
-      fi
       handle_message "$line"
     done
 
-# Si mosquitto_sub muere, systemd nos reinicia.
+# Si mosquitto_sub muere, systemd nos reinicia. Antes de salir publicamos offline por si el broker
+# no llegó a procesar el LWT (p. ej. apagado controlado).
+publish "$TOPIC_STATUS" "offline" retain
 exit 1

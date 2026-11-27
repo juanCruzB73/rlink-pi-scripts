@@ -20,6 +20,11 @@ ExecStart=/usr/local/bin/rlink-cmd
 Restart=always
 RestartSec=10
 Nice=10
+# mosquitto_sub dentro de un pipe no responde rápido a SIGTERM; bajamos el timeout y dejamos que
+# systemd mande SIGKILL al cgroup en 5s en vez de esperar los 90s default.
+TimeoutStopSec=5
+KillMode=mixed
+SendSIGKILL=yes
 
 [Install]
 WantedBy=multi-user.target
